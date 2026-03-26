@@ -1,0 +1,547 @@
+-- =========================================================
+-- Alert Event 重构版 DDL（设计阶段完整版本，单机 / 非分布式）
+-- 设计目标：
+--   1) 对齐内容链路 DDL 的“真相层 + 服务层”思路
+--   2) 对齐 IOC DDL 的“明细/下钻与摘要/列表分离”思路
+--   3) 将 alert_event 拆为：
+--        a) hawkeye_dwd_alert_event         : 告警事实真相表（稳定字段）
+--        b) hawkeye_dwd_alert_event_status  : 告警管理当前状态表（高频变更字段）
+--        c) hawkeye_ads_alert_event_latest  : 告警管理页/搜索页服务表（纯服务投影）
+--        d) hawkeye_ads_daily_dashboard     : 按 report_date 归因的当前态日聚合表
+--
+-- 适用前提：
+--   1) 不考虑同一个 event_id 的历史版本，只保留当前态
+--   2) 告警列表/筛选/搜索：优先查 hawkeye_ads_alert_event_latest
+--   3) 告警详情/审计回表：查 hawkeye_dwd_alert_event
+--   4) 处置状态/已读/误报/案件线索流转：查 hawkeye_dwd_alert_event_status
+--
+-- 说明：
+--   1) alert_event 不再重复承载完整 entities / IOC 明细；
+--      完整结构化详情回到 hawkeye_dwd_intel_content / hawkeye_dwd_intel_ioc
+--   2) 服务表只保留列表页真正高频需要的轻量字段
+--   3) dashboard 明确是“按 report_date 归因的当前态汇总”，
+--      不是保留历史状态快照的时态事实表
+-- =========================================================
+
+CREATE DATABASE IF NOT EXISTS hawkeye;
+
+DROP TABLE IF EXISTS hawkeye.hawkeye_ads_daily_dashboard;
+DROP TABLE IF EXISTS hawkeye.hawkeye_ads_alert_event_latest;
+DROP TABLE IF EXISTS hawkeye.hawkeye_dwd_alert_event_status;
+DROP TABLE IF EXISTS hawkeye.hawkeye_dwd_alert_event;
+
+
+-- =========================================================
+-- 1) 告警事实真相表
+--    职责：
+--      1. 承接引擎产出的稳定告警事实
+--      2. 作为告警服务表的唯一热数据来源之一
+--      3. 只保留当前 event_id 的当前事实，不保留历史版本
+--
+--    设计要点：
+--      1. 将“稳定事实”与“高频状态”拆开
+--      2. 不再在告警表里重复完整 entities / IOC 明细
+--      3. 只保留列表与详情真正需要的轻量摘要
+--      4. 物理设计更偏“详情 / 审计 / 回表源”，而不是高频搜索页
+--      5. 搜索字段统一为 normalized_text，search_text 作为兼容别名
+-- =========================================================
+CREATE TABLE hawkeye.hawkeye_dwd_alert_event
+(
+    -- -----------------------------------------------------
+    -- A. 主键与核心关联
+    -- -----------------------------------------------------
+    `event_id` String COMMENT '告警/事件唯一ID；事实表主键',
+    `observation_id` String COMMENT '稳定 observation_id；用于幂等、去重、审计',
+    `content_id` String COMMENT '关联 content_id；回到内容详情',
+    `trace_id` String DEFAULT '' COMMENT '全链路追踪ID',
+    `profile_id` String DEFAULT '' COMMENT '画像ID',
+    `actor_id_norm` String DEFAULT '' COMMENT '主体规范化ID；用于主体维度统计',
+    `source_registry_id` String DEFAULT '' COMMENT '来源注册表ID',
+
+    -- -----------------------------------------------------
+    -- B. 来源 / 账号 / 归属快照
+    -- -----------------------------------------------------
+    `platform` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '平台，例如 Telegram / Twitter / Forum / Market',
+    `source_type` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '来源类型，例如 post / thread / article / channel',
+    `content_kind` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '内容形态，例如 text / image / video / thread / product',
+    `site_name` LowCardinality(String) DEFAULT '' COMMENT '站点 / 论坛 / 市场 / 频道名',
+    `media_name` String DEFAULT '' COMMENT '媒体/频道/论坛名',
+    `domain` String DEFAULT '' COMMENT '归一化域名',
+    `url` String DEFAULT '' COMMENT '原始URL / 规范化跳转URL',
+
+    `source_handle` String DEFAULT '' COMMENT '原始账号/频道handle',
+    `source_handle_norm` String DEFAULT '' COMMENT '标准化账号/频道handle',
+    `author_name` String DEFAULT '' COMMENT '作者显示名',
+    `channel_id` String DEFAULT '' COMMENT '频道/群组ID',
+
+    -- -----------------------------------------------------
+    -- C. 时间字段
+    -- -----------------------------------------------------
+    `publish_time` DateTime64(3) DEFAULT now64(3) COMMENT '原内容发布时间',
+    `publish_date` Date MATERIALIZED toDate(publish_time) COMMENT '发布时间对应业务日期',
+    `first_seen_time` DateTime64(3) DEFAULT now64(3) COMMENT '首次发现时间',
+    `last_seen_time` DateTime64(3) DEFAULT now64(3) COMMENT '最近发现时间',
+    `report_time` DateTime64(3) DEFAULT now64(3) COMMENT '告警生成时间；建议写入后保持稳定',
+    `report_date` Date MATERIALIZED toDate(report_time) COMMENT '告警生成日期；服务表和看板主时间维度',
+    `update_time` DateTime64(3) DEFAULT now64(3) COMMENT '最近更新时间；供增量刷新服务表',
+
+    -- -----------------------------------------------------
+    -- D. 告警业务主字段
+    -- -----------------------------------------------------
+    `title` String DEFAULT '' COMMENT '标题 / 告警标题',
+    `text_preview` String CODEC(ZSTD(3)) DEFAULT '' COMMENT '列表摘要 / 正文预览',
+    `language` LowCardinality(String) DEFAULT '' COMMENT '语言',
+    `region` LowCardinality(String) DEFAULT '' COMMENT '地区展示串；如 广东省/广州市',
+    `region_province` LowCardinality(String) DEFAULT '' COMMENT '一级地区；供筛选统计',
+    `industry` LowCardinality(String) DEFAULT '' COMMENT '行业口径',
+    `topic` LowCardinality(String) DEFAULT '' COMMENT '专题口径',
+    `query_family` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '查询家族',
+    `route_corridor` LowCardinality(String) DEFAULT '' COMMENT '路线走廊 / 通道标签',
+    `rule_code` String DEFAULT '' COMMENT '命中规则编码',
+    `rule_name` String DEFAULT '' COMMENT '命中规则展示名',
+    `threat_category` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '主威胁类别',
+    `severity` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '风险等级；LOW/MEDIUM/HIGH/CRITICAL',
+    `risk_score` Float32 DEFAULT 0 COMMENT '风险分',
+    `confidence_score` Float32 DEFAULT 0 COMMENT '置信分',
+    `keyword_hits` Array(String) DEFAULT [] COMMENT '命中关键词列表',
+    `snapshot_s3_key` String DEFAULT '' COMMENT '主截图对象路径；详情页快速预览',
+
+    -- -----------------------------------------------------
+    -- E. 轻量结构化摘要
+    --    说明：
+    --      1) 告警表不再保存完整 entities 明细
+    --      2) entities / IOC 明细统一回内容表、IOC 明细表下钻
+    --      3) 这里只保留列表页真正高频需要的轻量摘要
+    -- -----------------------------------------------------
+    `entity_tags` Array(String) DEFAULT [] COMMENT '实体标签简表；供列表页直接展示',
+    `entity_values_text` String DEFAULT '' COMMENT '实体值拼接文本；作为实体检索载体',
+    `ioc_display_tags` Array(String) DEFAULT [] COMMENT 'IOC 展示标签；供列表页直接展示',
+    `primary_ioc_summary` String DEFAULT '' COMMENT '主IOC摘要；供列表页快速理解上下文',
+
+    -- -----------------------------------------------------
+    -- F. 搜索载体
+    --    说明：
+    --      1) normalized_text 作为统一搜索载体
+    --      2) search_text 作为兼容别名保留
+    -- -----------------------------------------------------
+    `normalized_text` String MATERIALIZED
+        lowerUTF8(
+            concat(
+                title, ' ',
+                text_preview, ' ',
+                author_name, ' ',
+                source_handle, ' ',
+                source_handle_norm, ' ',
+                site_name, ' ',
+                media_name, ' ',
+                rule_name, ' ',
+                arrayStringConcat(keyword_hits, ' '), ' ',
+                arrayStringConcat(entity_tags, ' '), ' ',
+                entity_values_text, ' ',
+                primary_ioc_summary
+            )
+        ) COMMENT '统一搜索载体；供服务表回灌与详情定位',
+    `search_text` String ALIAS normalized_text COMMENT '兼容字段；与 normalized_text 同义',
+
+    -- -----------------------------------------------------
+    -- G. 轻量扩展
+    -- -----------------------------------------------------
+    `extra_json` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '轻量扩展JSON；不承载大文本与冷数据',
+
+    -- -----------------------------------------------------
+    -- H. 索引设计
+    --    说明：
+    --      1) 此表不是主搜索表，因此只保留一小组高价值索引
+    --      2) update_time 供增量刷新服务表
+    -- -----------------------------------------------------
+    INDEX idx_alert_report_time report_time TYPE minmax GRANULARITY 1,
+    INDEX idx_alert_publish_time publish_time TYPE minmax GRANULARITY 1,
+    INDEX idx_alert_update_time update_time TYPE minmax GRANULARITY 1,
+    INDEX idx_alert_risk_score risk_score TYPE minmax GRANULARITY 4,
+    INDEX idx_alert_platform platform TYPE set(64) GRANULARITY 1,
+    INDEX idx_alert_source_type source_type TYPE set(32) GRANULARITY 1,
+    INDEX idx_alert_query_family query_family TYPE set(128) GRANULARITY 1,
+    INDEX idx_alert_threat_category threat_category TYPE set(64) GRANULARITY 1,
+    INDEX idx_alert_severity severity TYPE set(16) GRANULARITY 1,
+    INDEX idx_alert_observation_id observation_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_alert_content_id content_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_alert_profile_id profile_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_alert_source_handle_norm source_handle_norm TYPE bloom_filter(0.01) GRANULARITY 4
+)
+ENGINE = ReplacingMergeTree(update_time)
+PARTITION BY toYYYYMM(report_time)
+ORDER BY (event_id)
+TTL report_time + INTERVAL 730 DAY
+SETTINGS index_granularity = 8192;
+
+
+-- =========================================================
+-- 2) 告警管理当前状态表
+--    职责：
+--      1. 承接已读/误报/抑制/案件线索流转等高频变化字段
+--      2. 降低宽表 update / upsert 的 rewrite 成本
+--      3. 作为告警服务表的第二个热数据来源
+--
+--    设计要点：
+--      1. event_id 一条当前状态记录
+--      2. 将“运营态 / 处置态 / 跳转态”从事实表中拆出
+--      3. 查询列表页优先走 ads 服务表，不直接扫此表
+-- =========================================================
+CREATE TABLE hawkeye.hawkeye_dwd_alert_event_status
+(
+    -- -----------------------------------------------------
+    -- A. 主键与时间
+    -- -----------------------------------------------------
+    `event_id` String COMMENT '告警/事件唯一ID；状态表主键',
+    `report_time` DateTime64(3) DEFAULT now64(3) COMMENT '告警生成时间；用于分区与TTL',
+    `report_date` Date MATERIALIZED toDate(report_time) COMMENT '告警生成日期',
+    `update_time` DateTime64(3) DEFAULT now64(3) COMMENT '状态最近更新时间',
+
+    -- -----------------------------------------------------
+    -- B. 管理态字段（高频变化）
+    -- -----------------------------------------------------
+    `read_status` UInt8 DEFAULT 0 COMMENT '是否已读；0 未读，1 已读',
+    `read_time` Nullable(DateTime64(3)) DEFAULT NULL COMMENT '已读时间',
+    `false_positive` UInt8 DEFAULT 0 COMMENT '是否误报；0 否，1 是',
+    `is_suppressed` UInt8 DEFAULT 0 COMMENT '是否被抑制',
+    `is_monitor_target` UInt8 DEFAULT 0 COMMENT '是否重点监控对象',
+    `is_candidate_monitor` UInt8 DEFAULT 0 COMMENT '是否候选监控对象',
+    `disposition_status` LowCardinality(String) DEFAULT 'open' COMMENT '处置状态；open/assigned/confirmed/closed/case/clue/ignored',
+    `export_status` UInt8 DEFAULT 0 COMMENT '是否已导出',
+    `operator_note` String CODEC(ZSTD(3)) DEFAULT '' COMMENT '人工处置备注',
+
+    -- -----------------------------------------------------
+    -- C. 案件 / 线索 / 跳转态
+    -- -----------------------------------------------------
+    `case_id` String DEFAULT '' COMMENT '立案后的案件ID',
+    `case_status` LowCardinality(String) DEFAULT '' COMMENT '案件状态；如 open/in_progress/closed',
+    `clue_id` String DEFAULT '' COMMENT '转线索后的线索ID',
+    `clue_status` LowCardinality(String) DEFAULT '' COMMENT '线索状态；如 new/processing/archived',
+    `report_s3_uri` String DEFAULT '' COMMENT '完整告警报告对象路径',
+    `evidence_package_uri` String DEFAULT '' COMMENT '取证包下载路径',
+    `graph_entry_id` String DEFAULT '' COMMENT '关系图谱入口ID',
+    `graph_seed_node_type` LowCardinality(String) DEFAULT '' COMMENT '图谱入口节点类型',
+    `graph_jump_enabled` UInt8 DEFAULT 1 COMMENT '是否允许跳转关系图谱',
+    `detail_page_uri` String DEFAULT '' COMMENT '业务详情页跳转地址',
+
+    -- -----------------------------------------------------
+    -- D. 轻量扩展
+    -- -----------------------------------------------------
+    `extra_json` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '轻量扩展JSON',
+
+    -- -----------------------------------------------------
+    -- E. 索引设计
+    -- -----------------------------------------------------
+    INDEX idx_alert_status_update_time update_time TYPE minmax GRANULARITY 1,
+    INDEX idx_alert_status_disposition disposition_status TYPE set(16) GRANULARITY 1,
+    INDEX idx_alert_status_read_status read_status TYPE set(2) GRANULARITY 1,
+    INDEX idx_alert_status_false_positive false_positive TYPE set(2) GRANULARITY 1,
+    INDEX idx_alert_status_is_suppressed is_suppressed TYPE set(2) GRANULARITY 1,
+    INDEX idx_alert_status_case_id case_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_alert_status_clue_id clue_id TYPE bloom_filter(0.01) GRANULARITY 4
+)
+ENGINE = ReplacingMergeTree(update_time)
+PARTITION BY toYYYYMM(report_time)
+ORDER BY (event_id)
+TTL report_time + INTERVAL 730 DAY
+SETTINGS index_granularity = 8192;
+
+
+-- =========================================================
+-- 3) 当前态告警管理页 / 搜索页服务表
+--    职责：
+--      1. 面向前端告警列表、筛选、搜索页
+--      2. 不承载历史版本
+--      3. 只保留高频查询真正需要的字段
+--      4. 由 hawkeye_dwd_alert_event + hawkeye_dwd_alert_event_status 增量投影得到
+--
+--    设计要点：
+--      1. 列表页只查此表
+--      2. 完整 entities / IOC 明细回源详情表
+--      3. 明确为“纯服务投影表”，通过 event_id delete + insert 刷新
+--      4. 不依赖 ReplacingMergeTree 自身维护当前态，避免语义混用
+-- =========================================================
+CREATE TABLE hawkeye.hawkeye_ads_alert_event_latest
+(
+    -- -----------------------------------------------------
+    -- A. 主键与时间
+    -- -----------------------------------------------------
+    `event_id` String COMMENT '告警/事件唯一ID；列表服务表主键',
+    `observation_id` String DEFAULT '' COMMENT '观察结果ID',
+    `content_id` String DEFAULT '' COMMENT '关联内容ID',
+    `profile_id` String DEFAULT '' COMMENT '画像ID',
+    `actor_id_norm` String DEFAULT '' COMMENT '主体规范化ID',
+
+    `report_date` Date COMMENT '告警生成日期；列表页主时间筛选维度',
+    `report_time` DateTime64(3) COMMENT '告警生成时间',
+    `publish_time` DateTime64(3) COMMENT '原内容发布时间',
+    `update_time` DateTime64(3) COMMENT '最近更新时间；供增量重刷',
+
+    -- -----------------------------------------------------
+    -- B. 来源 / 平台 / 账号展示
+    -- -----------------------------------------------------
+    `platform` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '平台',
+    `source_type` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '来源类型',
+    `content_kind` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '内容形态',
+    `site_name` LowCardinality(String) DEFAULT '' COMMENT '站点名',
+    `media_name` String DEFAULT '' COMMENT '媒体/频道/论坛名',
+
+    `source_handle` String DEFAULT '' COMMENT '账号原始handle',
+    `source_handle_norm` String DEFAULT '' COMMENT '账号规范化handle',
+    `author_name` String DEFAULT '' COMMENT '作者显示名',
+    `channel_id` String DEFAULT '' COMMENT '频道/群组ID',
+
+    -- -----------------------------------------------------
+    -- C. 列表展示主字段
+    -- -----------------------------------------------------
+    `title` String DEFAULT '' COMMENT '标题 / 告警标题',
+    `text_preview` String CODEC(ZSTD(3)) DEFAULT '' COMMENT '正文摘要；列表卡片展示',
+    `language` LowCardinality(String) DEFAULT '' COMMENT '语言',
+    `region` LowCardinality(String) DEFAULT '' COMMENT '地区全量展示串',
+    `region_province` LowCardinality(String) DEFAULT '' COMMENT '省份/州',
+    `industry` LowCardinality(String) DEFAULT '' COMMENT '行业',
+    `topic` LowCardinality(String) DEFAULT '' COMMENT '主题',
+    `query_family` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '查询家族',
+    `route_corridor` LowCardinality(String) DEFAULT '' COMMENT '通道/线路',
+    `rule_code` String DEFAULT '' COMMENT '命中规则编码',
+    `rule_name` String DEFAULT '' COMMENT '命中规则展示名',
+
+    -- -----------------------------------------------------
+    -- D. 风险 / 业务标签
+    -- -----------------------------------------------------
+    `threat_category` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '威胁类别',
+    `severity` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '风险等级',
+    `risk_score` Float32 DEFAULT 0 COMMENT '风险分',
+    `confidence_score` Float32 DEFAULT 0 COMMENT '置信分',
+
+    -- -----------------------------------------------------
+    -- E. 搜索 / 筛选载体
+    -- -----------------------------------------------------
+    `keyword_hits` Array(String) DEFAULT [] COMMENT '命中关键词',
+    `entity_tags` Array(String) DEFAULT [] COMMENT '实体标签简表；供列表页展示',
+    `entity_values_text` String DEFAULT '' COMMENT '实体值拼接文本；供实体检索',
+    `ioc_display_tags` Array(String) DEFAULT [] COMMENT 'IOC 标签列表；供列表直接显示',
+    `primary_ioc_summary` String DEFAULT '' COMMENT '主IOC摘要',
+
+    `normalized_text` String COMMENT '列表搜索统一载体；直接由事实表回灌',
+    `search_text` String ALIAS normalized_text COMMENT '兼容字段；与 normalized_text 同义',
+
+    `search_title_text` String MATERIALIZED
+        lowerUTF8(concat(title, ' ', text_preview)) COMMENT '标题+摘要搜索载体',
+
+    -- -----------------------------------------------------
+    -- F. 当前管理态
+    -- -----------------------------------------------------
+    `read_status` UInt8 DEFAULT 0 COMMENT '是否已读',
+    `false_positive` UInt8 DEFAULT 0 COMMENT '是否误报',
+    `is_suppressed` UInt8 DEFAULT 0 COMMENT '是否被抑制',
+    `is_monitor_target` UInt8 DEFAULT 0 COMMENT '是否重点监控对象',
+    `is_candidate_monitor` UInt8 DEFAULT 0 COMMENT '是否候选监控对象',
+    `disposition_status` LowCardinality(String) DEFAULT 'open' COMMENT '处置状态',
+    `export_status` UInt8 DEFAULT 0 COMMENT '是否已导出',
+    `case_id` String DEFAULT '' COMMENT '案件ID',
+    `case_status` LowCardinality(String) DEFAULT '' COMMENT '案件状态',
+    `clue_id` String DEFAULT '' COMMENT '线索ID',
+    `clue_status` LowCardinality(String) DEFAULT '' COMMENT '线索状态',
+
+    -- -----------------------------------------------------
+    -- G. 轻量跳转字段
+    -- -----------------------------------------------------
+    `url` String DEFAULT '' COMMENT '原始URL；供跳转',
+    `detail_page_uri` String DEFAULT '' COMMENT '站内详情页URI；供前端跳转',
+    `snapshot_s3_key` String DEFAULT '' COMMENT '主截图对象路径；列表悬浮预览',
+    `graph_entry_id` String DEFAULT '' COMMENT '关系图谱入口ID',
+    `graph_seed_node_type` LowCardinality(String) DEFAULT '' COMMENT '图谱入口节点类型',
+    `graph_jump_enabled` UInt8 DEFAULT 1 COMMENT '是否允许跳转关系图谱',
+
+    -- -----------------------------------------------------
+    -- H. 索引设计
+    --    说明：
+    --      1) 该表是告警管理页主表，因此索引设计偏查询
+    --      2) normalized_text / entity_values_text 是两类主搜索载体
+    -- -----------------------------------------------------
+    INDEX idx_alert_latest_report_time report_time TYPE minmax GRANULARITY 1,
+    INDEX idx_alert_latest_publish_time publish_time TYPE minmax GRANULARITY 1,
+    INDEX idx_alert_latest_update_time update_time TYPE minmax GRANULARITY 1,
+    INDEX idx_alert_latest_risk_score risk_score TYPE minmax GRANULARITY 4,
+    INDEX idx_alert_latest_platform platform TYPE set(64) GRANULARITY 1,
+    INDEX idx_alert_latest_source_type source_type TYPE set(32) GRANULARITY 1,
+    INDEX idx_alert_latest_content_kind content_kind TYPE set(32) GRANULARITY 1,
+    INDEX idx_alert_latest_threat_category threat_category TYPE set(64) GRANULARITY 1,
+    INDEX idx_alert_latest_severity severity TYPE set(16) GRANULARITY 1,
+    INDEX idx_alert_latest_query_family query_family TYPE set(128) GRANULARITY 1,
+    INDEX idx_alert_latest_disposition disposition_status TYPE set(16) GRANULARITY 1,
+    INDEX idx_alert_latest_read_status read_status TYPE set(2) GRANULARITY 1,
+    INDEX idx_alert_latest_false_positive false_positive TYPE set(2) GRANULARITY 1,
+    INDEX idx_alert_latest_is_suppressed is_suppressed TYPE set(2) GRANULARITY 1,
+    INDEX idx_alert_latest_source_handle_norm source_handle_norm TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_alert_latest_profile_id profile_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_alert_latest_case_id case_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_alert_latest_normalized_text normalized_text TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1,
+    INDEX idx_alert_latest_search_title_text search_title_text TYPE tokenbf_v1(16384, 3, 0) GRANULARITY 1,
+    INDEX idx_alert_latest_entity_values_text entity_values_text TYPE tokenbf_v1(16384, 3, 0) GRANULARITY 1
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(report_date)
+ORDER BY (report_date, disposition_status, false_positive, is_suppressed, severity, threat_category, event_id)
+TTL report_date + INTERVAL 730 DAY
+SETTINGS index_granularity = 8192;
+
+
+-- =========================================================
+-- 4) 日聚合 / 看板结果表
+--    职责：
+--      1) 存最终聚合结果，不存 AggregateState
+--      2) 口径明确为“按 report_date 归因的当前态汇总”
+--      3) 支持按分区/按日幂等重刷
+--
+--    说明：
+--      1) 该表不是历史状态快照表
+--      2) 若未来需要“某天当时看到的状态快照”，应单独建设 snapshot 表
+-- =========================================================
+CREATE TABLE hawkeye.hawkeye_ads_daily_dashboard
+(
+    `stat_date` Date COMMENT '统计日期；取 report_date',
+    `platform` LowCardinality(String) COMMENT '平台',
+    `site_name` LowCardinality(String) COMMENT '站点名',
+    `source_type` LowCardinality(String) COMMENT '来源类型',
+    `content_kind` LowCardinality(String) COMMENT '内容形态',
+    `threat_category` LowCardinality(String) COMMENT '主威胁类别',
+    `severity` LowCardinality(String) COMMENT '风险等级',
+    `query_family` LowCardinality(String) COMMENT '查询家族',
+    `route_corridor` LowCardinality(String) COMMENT '路线走廊',
+
+    `event_count` UInt64 COMMENT '事件总数',
+    `content_count` UInt64 COMMENT '去重内容数',
+    `distinct_actor_count` UInt64 COMMENT '去重主体数（仅统计非空 actor_id_norm）',
+    `distinct_profile_count` UInt64 COMMENT '去重画像数（仅统计非空 profile_id）',
+    `suppressed_count` UInt64 COMMENT '被抑制事件数',
+    `false_positive_count` UInt64 COMMENT '误报事件数',
+    `monitor_target_count` UInt64 COMMENT '重点监控对象事件数',
+    `candidate_monitor_count` UInt64 COMMENT '候选监控对象事件数',
+    `open_count` UInt64 COMMENT '当前 open 状态事件数',
+    `case_count` UInt64 COMMENT '已转案件事件数',
+    `clue_count` UInt64 COMMENT '已转线索事件数',
+    `avg_risk_score` Float32 COMMENT '平均风险分',
+    `max_risk_score` Float32 COMMENT '最大风险分',
+    `update_time` DateTime64(3) COMMENT '本次聚合刷新时间'
+)
+ENGINE = ReplacingMergeTree(update_time)
+PARTITION BY toYYYYMM(stat_date)
+ORDER BY (stat_date, platform, site_name, source_type, content_kind, threat_category, severity, query_family, route_corridor)
+TTL stat_date + INTERVAL 1095 DAY
+SETTINGS index_granularity = 8192;
+
+
+-- =========================================================
+-- 5) 推荐刷新 SQL（注释保留，供任务编排直接参考）
+-- =========================================================
+
+-- 5.1 告警服务表全量 / 分区刷新示意
+--     说明：
+--       1) 服务表是纯投影表，建议按 event_id delete + insert 或按分区重刷
+--       2) 这里显式处理“状态表无匹配行”的默认值，避免 LEFT JOIN 默认空串/0 污染业务语义
+--
+-- INSERT INTO hawkeye.hawkeye_ads_alert_event_latest
+-- SELECT
+--     e.event_id,
+--     e.observation_id,
+--     e.content_id,
+--     e.profile_id,
+--     e.actor_id_norm,
+--     e.report_date,
+--     e.report_time,
+--     e.publish_time,
+--     if(s.event_id = '', e.update_time, greatest(e.update_time, s.update_time)) AS update_time,
+--     e.platform,
+--     e.source_type,
+--     e.content_kind,
+--     e.site_name,
+--     e.media_name,
+--     e.source_handle,
+--     e.source_handle_norm,
+--     e.author_name,
+--     e.channel_id,
+--     e.title,
+--     e.text_preview,
+--     e.language,
+--     e.region,
+--     e.region_province,
+--     e.industry,
+--     e.topic,
+--     e.query_family,
+--     e.route_corridor,
+--     e.rule_code,
+--     e.rule_name,
+--     e.threat_category,
+--     e.severity,
+--     e.risk_score,
+--     e.confidence_score,
+--     e.keyword_hits,
+--     e.entity_tags,
+--     e.entity_values_text,
+--     e.ioc_display_tags,
+--     e.primary_ioc_summary,
+--     e.normalized_text,
+--     if(s.event_id = '', 0, s.read_status) AS read_status,
+--     if(s.event_id = '', 0, s.false_positive) AS false_positive,
+--     if(s.event_id = '', 0, s.is_suppressed) AS is_suppressed,
+--     if(s.event_id = '', 0, s.is_monitor_target) AS is_monitor_target,
+--     if(s.event_id = '', 0, s.is_candidate_monitor) AS is_candidate_monitor,
+--     if(s.event_id = '', 'open', s.disposition_status) AS disposition_status,
+--     if(s.event_id = '', 0, s.export_status) AS export_status,
+--     if(s.event_id = '', '', s.case_id) AS case_id,
+--     if(s.event_id = '', '', s.case_status) AS case_status,
+--     if(s.event_id = '', '', s.clue_id) AS clue_id,
+--     if(s.event_id = '', '', s.clue_status) AS clue_status,
+--     e.url,
+--     if(s.event_id = '', '', s.detail_page_uri) AS detail_page_uri,
+--     e.snapshot_s3_key,
+--     if(s.event_id = '', '', s.graph_entry_id) AS graph_entry_id,
+--     if(s.event_id = '', '', s.graph_seed_node_type) AS graph_seed_node_type,
+--     if(s.event_id = '', 1, s.graph_jump_enabled) AS graph_jump_enabled
+-- FROM hawkeye.hawkeye_dwd_alert_event e
+-- LEFT JOIN hawkeye.hawkeye_dwd_alert_event_status s
+--     ON e.event_id = s.event_id;
+
+-- 5.2 dashboard 聚合刷新示意
+--     说明：
+--       1) 该表口径是“按 report_date 归因的当前态汇总”
+--       2) 去重主体/画像时显式排空
+--
+-- INSERT INTO hawkeye.hawkeye_ads_daily_dashboard
+-- SELECT
+--     report_date AS stat_date,
+--     platform,
+--     site_name,
+--     source_type,
+--     content_kind,
+--     threat_category,
+--     severity,
+--     query_family,
+--     route_corridor,
+--     count() AS event_count,
+--     uniqCombined64(content_id) AS content_count,
+--     uniqCombined64If(actor_id_norm, length(actor_id_norm) > 0) AS distinct_actor_count,
+--     uniqCombined64If(profile_id, length(profile_id) > 0) AS distinct_profile_count,
+--     sum(if(is_suppressed = 1, 1, 0)) AS suppressed_count,
+--     sum(if(false_positive = 1, 1, 0)) AS false_positive_count,
+--     sum(if(is_monitor_target = 1, 1, 0)) AS monitor_target_count,
+--     sum(if(is_candidate_monitor = 1, 1, 0)) AS candidate_monitor_count,
+--     sum(if(disposition_status = 'open', 1, 0)) AS open_count,
+--     sum(if(disposition_status = 'case', 1, 0)) AS case_count,
+--     sum(if(disposition_status = 'clue', 1, 0)) AS clue_count,
+--     avg(risk_score) AS avg_risk_score,
+--     max(risk_score) AS max_risk_score,
+--     now64(3) AS update_time
+-- FROM hawkeye.hawkeye_ads_alert_event_latest
+-- GROUP BY
+--     stat_date,
+--     platform,
+--     site_name,
+--     source_type,
+--     content_kind,
+--     threat_category,
+--     severity,
+--     query_family,
+--     route_corridor;

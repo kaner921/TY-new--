@@ -1,0 +1,292 @@
+-- =========================================================
+-- IOC 相关对象重构版 DDL（设计阶段完整版本）
+-- 设计目标：
+--   1) 保留：hawkeye_dwd_intel_ioc -> mv_hawkeye_ads_ioc_lookup
+--      -> hawkeye_ads_ioc_lookup -> hawkeye_vw_ioc_lookup 这条链路
+--   2) 服务层主键收敛为：
+--         (observable_subtype, ioc_value_norm)
+--   3) hawkeye_vw_ioc_lookup 只负责 IOC 摘要，不再承担平台/账号分布
+--   4) 平台/账号分布统一回到 hawkeye_dwd_intel_ioc 下钻
+--   5) 明确 account_key 生成规则，并避免“全缺失账号”被压成一个伪账号
+--   6) 聚合计数对空值显式排除，避免未知值被算成 1
+-- =========================================================
+
+CREATE DATABASE IF NOT EXISTS hawkeye;
+
+-- =========================================================
+-- 清理对象（设计阶段完整版本）
+-- =========================================================
+DROP VIEW IF EXISTS hawkeye.hawkeye_vw_ioc_lookup;
+DROP VIEW IF EXISTS hawkeye.mv_hawkeye_ads_ioc_lookup;
+DROP TABLE IF EXISTS hawkeye.hawkeye_ads_ioc_lookup;
+DROP TABLE IF EXISTS hawkeye.hawkeye_dwd_intel_ioc;
+
+
+-- =========================================================
+-- 1) IOC 明细真相表
+--    职责：
+--      1) 存每一次 IOC 命中的明细事实
+--      2) 作为 IOC 摘要服务层的唯一上游真相来源
+--      3) 直接承接“平台分布 / 账号分布 / 明细命中 / 证据回表”下钻查询
+--
+--    设计要点：
+--      1) 明细层保留完整 event/content/profile/IOC 主体结构
+--      2) 服务层主键不再依赖 observable_id，但明细层继续保留
+--      3) 仅补少量账号展示字段：
+--           - source_handle
+--           - author_name
+--           - channel_id
+--      4) 新增 account_key 作为统一账号键：
+--           profile_id
+--           > source_handle_norm
+--           > platform#channel#channel_id
+--           > platform#handle#source_handle
+--           > platform#author#author_name
+--         若以上全部缺失，则置空字符串，不参与账号去重
+-- =========================================================
+CREATE TABLE hawkeye.hawkeye_dwd_intel_ioc
+(
+    -- -----------------------------------------------------
+    -- A. 核心关联键
+    -- -----------------------------------------------------
+    `event_id` String COMMENT '关联 event_id；用于回到告警/事件层',
+    `observation_id` String COMMENT '关联 observation_id；用于回到观察结果层',
+    `content_id` String COMMENT '关联 content_id；用于回到消息详情',
+    `trace_id` String DEFAULT '' COMMENT '全链路 trace_id；用于排障/审计',
+    `profile_id` String DEFAULT '' COMMENT '画像 ID；账号去重时优先作为稳定键',
+    `evidence_id` String DEFAULT '' COMMENT '主证据 ID',
+    `source_registry_id` String DEFAULT '' COMMENT '来源注册表 ID',
+
+    -- -----------------------------------------------------
+    -- B. 高频上下文
+    -- -----------------------------------------------------
+    `platform` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '平台，例如 Telegram / Twitter / Forum / Market',
+    `source_type` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '来源类型',
+    `site_name` LowCardinality(String) DEFAULT '' COMMENT '站点名 / 论坛名 / 市场名',
+
+    `source_handle_norm` String DEFAULT '' COMMENT '标准化账号标识；账号去重的第二优先键',
+
+    -- 少量账号展示字段
+    `source_handle` String DEFAULT '' COMMENT '账号/频道原始 handle；供 IOC -> 账号下钻展示',
+    `author_name` String DEFAULT '' COMMENT '账号展示名 / 昵称；供前端列表展示',
+    `channel_id` String DEFAULT '' COMMENT '频道/群组 ID；适配 Telegram / Discord 等渠道',
+
+    -- 统一账号键
+    `account_key` String MATERIALIZED
+        multiIf(
+            length(profile_id) > 0,
+                concat('profile#', profile_id),
+            length(source_handle_norm) > 0,
+                concat(toString(platform), '#norm#', source_handle_norm),
+            length(channel_id) > 0,
+                concat(toString(platform), '#channel#', channel_id),
+            length(source_handle) > 0,
+                concat(toString(platform), '#handle#', source_handle),
+            length(author_name) > 0,
+                concat(toString(platform), '#author#', author_name),
+            ''
+        ) COMMENT '账号统一键：profile_id > source_handle_norm > channel_id > source_handle > author_name；全缺失时为空字符串',
+
+    -- -----------------------------------------------------
+    -- C. 时间与业务上下文
+    -- -----------------------------------------------------
+    `report_time` DateTime64(3) DEFAULT now64(3) COMMENT 'IOC 产出时间',
+    `event_date` Date MATERIALIZED toDate(report_time) COMMENT 'IOC 对应日期',
+    `threat_category` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '主威胁类别',
+    `query_family` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '查询家族',
+
+    -- -----------------------------------------------------
+    -- D. IOC 主体
+    -- -----------------------------------------------------
+    `observable_id` String COMMENT '稳定 observable_id；保留在明细层，不再作为服务层主键',
+    `observable_category` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT 'IOC 大类',
+    `observable_subtype` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT 'IOC 小类；服务层主键的一部分',
+    `ioc_value_raw` String COMMENT '原始 IOC 值',
+    `ioc_value_norm` String COMMENT '标准化 IOC 值；服务层主键的一部分',
+    `display_value` String DEFAULT '' COMMENT '前端展示值',
+    `ioc_domain` String DEFAULT '' COMMENT '关联域名/主域',
+
+    `is_high_value` UInt8 DEFAULT 0 COMMENT '是否高价值 IOC',
+    `is_primary` UInt8 DEFAULT 0 COMMENT '是否主 IOC',
+    `confidence_score` Float32 DEFAULT 0 COMMENT 'IOC 置信分',
+    `evidence_score` Float32 DEFAULT 0 COMMENT '证据强度分',
+    `evidence_text` String CODEC(ZSTD(3)) DEFAULT '' COMMENT '支撑 IOC 的关键证据片段',
+
+    `first_seen_at` DateTime64(3) DEFAULT now64(3) COMMENT '首次见到此 IOC 的时间',
+    `last_seen_at` DateTime64(3) DEFAULT now64(3) COMMENT '最近见到此 IOC 的时间',
+
+    -- -----------------------------------------------------
+    -- E. 索引设计
+    --    说明：
+    --      1) 明细表主查询路径是：
+    --           observable_subtype + ioc_value_norm 精确下钻
+    --      2) 再按时间、平台、账号做分布统计/样本回查
+    -- -----------------------------------------------------
+    INDEX idx_ioc_report_time report_time TYPE minmax GRANULARITY 1,
+    INDEX idx_ioc_platform platform TYPE set(64) GRANULARITY 1,
+    INDEX idx_ioc_observable_id observable_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_ioc_subtype observable_subtype TYPE set(256) GRANULARITY 1,
+    INDEX idx_ioc_content_id content_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_ioc_event_id event_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_ioc_account_key account_key TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_ioc_high_value is_high_value TYPE set(2) GRANULARITY 1
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(report_time)
+ORDER BY (observable_subtype, ioc_value_norm, report_time, event_id)
+TTL report_time + INTERVAL 1095 DAY
+SETTINGS index_granularity = 8192;
+
+
+-- =========================================================
+-- 2) IOC 摘要聚合表（状态表）
+--    职责：
+--      1) 只为 IOC 摘要服务
+--      2) 不再承担平台分布 / 账号分布
+--      3) 服务层主键收敛为：
+--           (observable_subtype, ioc_value_norm)
+--
+--    设计说明：
+--      1) observable_id 不再参与 ORDER BY / GROUP BY 主键
+--      2) 但仍保留 sample_observable_id_state，作为最近样本 observable_id
+--      3) account_count 只统计“可识别账号”的数量
+--         （account_key != ''），不代表账号分布明细
+--      4) site_count / profile_count / account_count 全部显式排空
+-- =========================================================
+CREATE TABLE hawkeye.hawkeye_ads_ioc_lookup
+(
+    -- -----------------------------------------------------
+    -- A. 服务层主键
+    -- -----------------------------------------------------
+    `observable_subtype` String COMMENT 'IOC 小类；服务层主键的一部分',
+    `ioc_value_norm` String COMMENT '标准化 IOC 值；服务层主键的一部分',
+
+    -- -----------------------------------------------------
+    -- B. 样本字段（仅供摘要页展示，不参与主键）
+    -- -----------------------------------------------------
+    `sample_observable_id_state` AggregateFunction(argMax, String, Tuple(DateTime64(3), DateTime64(3), String)) COMMENT '最近样本 observable_id 状态',
+    `sample_ioc_value_raw_state` AggregateFunction(argMax, String, Tuple(DateTime64(3), DateTime64(3), String)) COMMENT '原始 IOC 值样本状态',
+    `sample_display_value_state` AggregateFunction(argMax, String, Tuple(DateTime64(3), DateTime64(3), String)) COMMENT '展示值样本状态',
+    `observable_category_state` AggregateFunction(argMax, String, Tuple(DateTime64(3), DateTime64(3), String)) COMMENT 'IOC 大类样本状态',
+    `sample_platform_state` AggregateFunction(argMax, String, Tuple(DateTime64(3), DateTime64(3), String)) COMMENT '平台样本状态',
+    `sample_site_name_state` AggregateFunction(argMax, String, Tuple(DateTime64(3), DateTime64(3), String)) COMMENT '站点样本状态',
+    `sample_profile_id_state` AggregateFunction(argMax, String, Tuple(DateTime64(3), DateTime64(3), String)) COMMENT '画像样本状态',
+    `sample_threat_category_state` AggregateFunction(argMax, String, Tuple(DateTime64(3), DateTime64(3), String)) COMMENT '威胁类别样本状态',
+    `sample_query_family_state` AggregateFunction(argMax, String, Tuple(DateTime64(3), DateTime64(3), String)) COMMENT '查询家族样本状态',
+
+    -- -----------------------------------------------------
+    -- C. 时间与风险摘要
+    -- -----------------------------------------------------
+    `first_seen_time` SimpleAggregateFunction(min, DateTime64(3)) COMMENT '首次发现时间',
+    `last_seen_time` SimpleAggregateFunction(max, DateTime64(3)) COMMENT '最近发现时间',
+    `last_report_time` SimpleAggregateFunction(max, DateTime64(3)) COMMENT '最近产出时间',
+    `is_high_value` SimpleAggregateFunction(max, UInt8) COMMENT '是否高价值 IOC',
+    `max_confidence_score` SimpleAggregateFunction(max, Float32) COMMENT '最高置信分',
+
+    -- -----------------------------------------------------
+    -- D. 去重计数摘要
+    --    说明：
+    --      1) platform_count：统计涉及平台数
+    --      2) site_count：仅统计非空 site_name
+    --      3) profile_count：仅统计非空 profile_id
+    --      4) account_count：仅统计可识别账号（account_key != ''）
+    -- -----------------------------------------------------
+    `platform_count` AggregateFunction(uniqCombined64, String) COMMENT '涉及平台数（摘要值）',
+    `site_count` AggregateFunction(uniqCombined64If, String, UInt8) COMMENT '涉及站点数（仅统计非空 site_name）',
+    `content_count` AggregateFunction(uniqCombined64, String) COMMENT '关联内容数（摘要值）',
+    `event_count` AggregateFunction(uniqCombined64, String) COMMENT '关联事件数（摘要值）',
+    `profile_count` AggregateFunction(uniqCombined64If, String, UInt8) COMMENT '关联画像数（仅统计非空 profile_id）',
+    `account_count` AggregateFunction(uniqCombined64If, String, UInt8) COMMENT '关联账号数（仅统计可识别账号）'
+)
+ENGINE = AggregatingMergeTree()
+ORDER BY (observable_subtype, ioc_value_norm)
+SETTINGS index_granularity = 8192;
+
+
+-- =========================================================
+-- 3) IOC 聚合物化视图
+--    职责：
+--      1) 从 dwd 明细表实时 / 准实时汇总到 ads_ioc_lookup
+--      2) 主分组键收敛为：
+--           observable_subtype + ioc_value_norm
+--      3) observable_id 只作为 sample，不再参与 GROUP BY
+-- =========================================================
+CREATE MATERIALIZED VIEW hawkeye.mv_hawkeye_ads_ioc_lookup
+TO hawkeye.hawkeye_ads_ioc_lookup
+AS
+SELECT
+    toString(observable_subtype) AS observable_subtype,
+    ioc_value_norm,
+
+    argMaxState(observable_id, tuple(last_seen_at, report_time, event_id)) AS sample_observable_id_state,
+    argMaxState(ioc_value_raw, tuple(last_seen_at, report_time, event_id)) AS sample_ioc_value_raw_state,
+    argMaxState(display_value, tuple(last_seen_at, report_time, event_id)) AS sample_display_value_state,
+    argMaxState(toString(observable_category), tuple(last_seen_at, report_time, event_id)) AS observable_category_state,
+    argMaxState(toString(platform), tuple(last_seen_at, report_time, event_id)) AS sample_platform_state,
+    argMaxState(toString(site_name), tuple(last_seen_at, report_time, event_id)) AS sample_site_name_state,
+    argMaxState(profile_id, tuple(last_seen_at, report_time, event_id)) AS sample_profile_id_state,
+    argMaxState(toString(threat_category), tuple(last_seen_at, report_time, event_id)) AS sample_threat_category_state,
+    argMaxState(toString(query_family), tuple(last_seen_at, report_time, event_id)) AS sample_query_family_state,
+
+    min(first_seen_at) AS first_seen_time,
+    max(last_seen_at) AS last_seen_time,
+    max(report_time) AS last_report_time,
+    max(is_high_value) AS is_high_value,
+    max(confidence_score) AS max_confidence_score,
+
+    uniqCombined64State(toString(platform)) AS platform_count,
+    uniqCombined64IfState(toString(site_name), length(toString(site_name)) > 0) AS site_count,
+    uniqCombined64State(content_id) AS content_count,
+    uniqCombined64State(event_id) AS event_count,
+    uniqCombined64IfState(profile_id, length(profile_id) > 0) AS profile_count,
+    uniqCombined64IfState(account_key, length(account_key) > 0) AS account_count
+FROM hawkeye.hawkeye_dwd_intel_ioc
+GROUP BY
+    observable_subtype,
+    ioc_value_norm;
+
+
+-- =========================================================
+-- 4) IOC 检索摘要视图
+--    职责：
+--      1) 只提供 IOC 摘要
+--      2) 不再输出 ioc_type 兼容别名
+--      3) 不再输出平台分布 / 账号分布
+--      4) 仅暴露摘要页需要的 sample + count + 时间字段
+--
+--    说明：
+--      - 新接口统一使用 observable_subtype
+--      - 若要看“出现在哪些平台 / 哪些账号发过”，
+--        直接回 hawkeye_dwd_intel_ioc 下钻
+-- =========================================================
+CREATE VIEW hawkeye.hawkeye_vw_ioc_lookup AS
+SELECT
+    observable_subtype,
+    ioc_value_norm,
+
+    argMaxMerge(sample_observable_id_state) AS sample_observable_id,
+    argMaxMerge(sample_ioc_value_raw_state) AS sample_ioc_value_raw,
+    argMaxMerge(sample_display_value_state) AS sample_display_value,
+    argMaxMerge(observable_category_state) AS observable_category,
+    argMaxMerge(sample_platform_state) AS sample_platform,
+    argMaxMerge(sample_site_name_state) AS sample_site_name,
+    argMaxMerge(sample_profile_id_state) AS sample_profile_id,
+    argMaxMerge(sample_threat_category_state) AS sample_threat_category,
+    argMaxMerge(sample_query_family_state) AS sample_query_family,
+
+    min(first_seen_time) AS first_seen_time,
+    max(last_seen_time) AS last_seen_time,
+    max(last_report_time) AS last_report_time,
+    max(is_high_value) AS is_high_value,
+    max(max_confidence_score) AS max_confidence_score,
+
+    uniqCombined64Merge(platform_count) AS platform_count,
+    uniqCombined64IfMerge(site_count) AS site_count,
+    uniqCombined64Merge(content_count) AS content_count,
+    uniqCombined64Merge(event_count) AS event_count,
+    uniqCombined64IfMerge(profile_count) AS profile_count,
+    uniqCombined64IfMerge(account_count) AS account_count
+FROM hawkeye.hawkeye_ads_ioc_lookup
+GROUP BY
+    observable_subtype,
+    ioc_value_norm;

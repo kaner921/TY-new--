@@ -1,0 +1,561 @@
+CREATE DATABASE IF NOT EXISTS hawkeye;
+
+-- =====================================================================
+-- USER DDL（重构版）
+-- ---------------------------------------------------------------------
+-- 目标：
+--   1) 明确拆分为两层：
+--      A. Graph 服务层：只服务 user.html 与高频人工 patch
+--      B. identity_profile 落库层：只服务画像算法结果落库与召回
+--
+--   2) 统一口径：
+--      - severity      = 标准风险等级字段（与 ALERT / CONTENT 对齐）
+--      - level         = 仅保留为兼容别名（前端/旧接口兼容）
+--      - threat_category = 标准威胁类别字段（与 ALERT / CONTENT 对齐）
+--      - category_label  = UI / 业务展示标签，不等价于 threat_category
+--
+--   3) identity_profile 契约对齐：
+--      - hawkeye_dwd_identity_profile_snapshot
+--        对齐 serialize_profile_snapshot_row
+--      - hawkeye_dwd_identity_profile_observable
+--        对齐 serialize_profile_observable_rows
+--      - hawkeye_dwd_identity_relation_score
+--        对齐 serialize_relation_score_row
+--
+--   4) 查询效率目标：
+--      - user.html 按 root_profile_id 点查：ORDER BY (root_profile_id, graph_date)
+--      - profile -> observables：走 hawkeye_dwd_identity_profile_observable
+--      - observable -> profiles：走 hawkeye_dwd_identity_observable_profile_lookup
+--
+-- 执行建议：
+--   1) 如需平滑迁移，先 CREATE 新表、回灌历史，再切流量；
+--   2) 如直接重建，按本脚本顺序 DROP / CREATE 即可；
+--   3) Graph 服务层与 identity_profile 落库层建议物理拆成两个 SQL 文件：
+--        4.1_user_graph_service.sql
+--        4.2_identity_profile_landing.sql
+-- =====================================================================
+
+
+-- =====================================================================
+-- A. Graph 服务层
+-- =====================================================================
+
+
+-- =====================================================================
+-- A1. 用户图谱当前态服务表
+-- ---------------------------------------------------------------------
+-- 职责：
+--   1) 面向 user.html 一次返回整包 fusionData
+--   2) 只保留高频查询真正需要的一组显式字段
+--   3) 节点 / 边 / 来源注册表 / 历史案件 / 案卷目录继续压成 JSON
+--   4) 原始内容 / IOC 明细 / 告警明细 / 冷数据统一回既有表下钻
+--
+-- 关键设计：
+--   1) root_profile_id 是主查询键，因此 ORDER BY 必须以 root_profile_id 开头
+--   2) graph_date 仅用于分区 / TTL / 重刷管理，不能放在 root_profile_id 前面
+--   3) severity 是标准风险级别字段；level 仅保留兼容 ALIAS
+--   4) category_label 是“UI 展示标签 / 业务标签”，不等价于 threat_category
+--   5) 增加 primary_handle_skeleton / source_handles_text / top_observables_text /
+--      behavior_tags_text 这四类轻量搜索字段，补齐画像检索能力
+-- =====================================================================
+CREATE TABLE hawkeye.hawkeye_ads_user_graph_latest
+(
+    -- -----------------------------------------------------------------
+    -- A. 主键与刷新时间
+    -- -----------------------------------------------------------------
+    `root_profile_id` String COMMENT '用户图谱根画像ID；本表主查询键；页面打开 user.html 时首先按此键点查',
+    `graph_entry_id` String DEFAULT '' COMMENT '图谱入口ID；兼容 alert/status 跳图谱链路',
+    `graph_version` String DEFAULT 'v2' COMMENT '图谱快照版本号；用于排障、比对、回放',
+    `snapshot_time` DateTime64(3) DEFAULT now64(3) COMMENT '本次图谱快照生成时间',
+    `graph_date` Date MATERIALIZED toDate(snapshot_time) COMMENT '图谱快照日期；仅用于分区与 TTL，不作为主查询键',
+    `update_time` DateTime64(3) DEFAULT now64(3) COMMENT '最近更新时间；供增量刷新与排障',
+
+    -- -----------------------------------------------------------------
+    -- B. 根对象 / 来源锚点
+    -- -----------------------------------------------------------------
+    `seed_event_id` String DEFAULT '' COMMENT '种子 event_id；回告警/案件链路',
+    `seed_content_id` String DEFAULT '' COMMENT '种子 content_id；回内容详情',
+    `seed_observation_id` String DEFAULT '' COMMENT '种子 observation_id；幂等与审计定位',
+    `seed_trace_id` String DEFAULT '' COMMENT '种子 trace_id；全链路追踪',
+    `seed_source_registry_id` String DEFAULT '' COMMENT '种子来源注册表ID；便于来源定位',
+
+    `primary_platform` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '根画像主平台',
+    `primary_handle` String DEFAULT '' COMMENT '根画像主账号/主 Handle',
+    `primary_handle_norm` String DEFAULT '' COMMENT '规范化 Handle；用于检索与去重',
+    `primary_handle_skeleton` String DEFAULT '' COMMENT 'Handle 骨架值；对应 identity_profile 的候选召回关键字段',
+    `display_name` String DEFAULT '' COMMENT '展示名称；优先用于 user 节点标题',
+
+    -- -----------------------------------------------------------------
+    -- C. 前端头部 / 立案摘要
+    -- -----------------------------------------------------------------
+    `category_label` LowCardinality(String) DEFAULT '' COMMENT 'UI/业务展示标签；例如“诈骗团伙/内容农场/高风险账户簇”；不等价于 threat_category',
+    `threat_category` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '标准威胁类别；与 CONTENT / ALERT 的 threat_category 对齐',
+    `severity` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '标准风险等级；与 CONTENT / ALERT 的 severity 对齐',
+    `level` LowCardinality(String) ALIAS severity COMMENT '兼容旧前端/旧接口字段；等价于 severity；新逻辑一律读写 severity',
+    `risk_score` Float32 DEFAULT 0 COMMENT '图谱综合风险分',
+    `description` String CODEC(ZSTD(3)) DEFAULT '' COMMENT '图谱摘要/立案简述/人工研判摘要',
+    `query_family` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '查询家族/任务簇；与上游内容/告警口径对齐',
+    `route_corridor` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '路线走廊/业务链路；与上游内容/告警口径对齐',
+
+    -- -----------------------------------------------------------------
+    -- D. 轻量可检索画像字段
+    -- -----------------------------------------------------------------
+    `source_handles_text` String DEFAULT '' COMMENT '画像涉及的来源账号/别名拼接文本；用于轻量搜索，不替代 profile_snapshot.source_handles 真相数组',
+    `behavior_tags_text` String DEFAULT '' COMMENT '行为标签拼接文本；例如拉群/引流/跳转支付/话术分发',
+    `top_observables_text` String DEFAULT '' COMMENT '高价值 observable 文本拼接；建议写入 Top-N display_value / ioc_value_norm / canonical_type 组合',
+    `top_observable_types_text` String DEFAULT '' COMMENT '高价值 observable 类型拼接；用于轻量过滤与召回增强',
+
+    -- -----------------------------------------------------------------
+    -- E. 时间与统计摘要
+    -- -----------------------------------------------------------------
+    `first_event_time` Nullable(DateTime64(3)) DEFAULT NULL COMMENT '图谱内最早证据时间',
+    `latest_event_time` Nullable(DateTime64(3)) DEFAULT NULL COMMENT '图谱内最新证据时间',
+    `node_count` UInt32 DEFAULT 0 COMMENT '节点总数',
+    `edge_count` UInt32 DEFAULT 0 COMMENT '边总数',
+    `user_node_count` UInt32 DEFAULT 0 COMMENT '用户类节点数',
+    `observable_node_count` UInt32 DEFAULT 0 COMMENT 'IOC/可观测物节点数',
+    `pending_alias_count` UInt32 DEFAULT 0 COMMENT '待确认同一性/别名总数',
+    `source_count` UInt32 DEFAULT 0 COMMENT '来源注册表条目数',
+    `history_case_count` UInt32 DEFAULT 0 COMMENT '历史案件条目数',
+    `dossier_count` UInt32 DEFAULT 0 COMMENT '案卷清单条目数',
+
+    -- -----------------------------------------------------------------
+    -- F. 图谱整包 JSON
+    -- -----------------------------------------------------------------
+    `nodes_json` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '图谱节点数组 JSON；对应 fusionData.nodes',
+    `links_json` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '图谱边数组 JSON；对应 fusionData.links',
+    `source_registry_json` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '来源注册表 JSON；对应 fusionData.sourceRegistry',
+    `history_cases_json` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '历史案件列表 JSON；低频展示缓存',
+    `dossiers_json` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '案卷清单 JSON；低频展示缓存',
+
+    -- -----------------------------------------------------------------
+    -- G. 统一搜索载体
+    -- -----------------------------------------------------------------
+    `normalized_text` String MATERIALIZED
+        lowerUTF8(
+            concat(
+                display_name, ' ',
+                primary_handle, ' ',
+                primary_handle_norm, ' ',
+                primary_handle_skeleton, ' ',
+                category_label, ' ',
+                threat_category, ' ',
+                severity, ' ',
+                description, ' ',
+                query_family, ' ',
+                route_corridor, ' ',
+                source_handles_text, ' ',
+                behavior_tags_text, ' ',
+                top_observables_text, ' ',
+                top_observable_types_text
+            )
+        ) COMMENT 'Graph 服务层统一轻量搜索载体；供按人/类/标签/observable 轻量检索',
+    `search_text` String ALIAS normalized_text COMMENT '兼容字段；与 normalized_text 同义',
+
+    -- -----------------------------------------------------------------
+    -- H. 轻量扩展
+    -- -----------------------------------------------------------------
+    `extra_json` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '少量扩展 JSON；不承载冷数据/大文本/原始 IOC 明细',
+
+    -- -----------------------------------------------------------------
+    -- I. 索引设计
+    -- -----------------------------------------------------------------
+    INDEX idx_user_graph_snapshot_time snapshot_time TYPE minmax GRANULARITY 1,
+    INDEX idx_user_graph_update_time update_time TYPE minmax GRANULARITY 1,
+    INDEX idx_user_graph_latest_event_time latest_event_time TYPE minmax GRANULARITY 1,
+    INDEX idx_user_graph_risk_score risk_score TYPE minmax GRANULARITY 4,
+
+    INDEX idx_user_graph_threat_category threat_category TYPE set(64) GRANULARITY 1,
+    INDEX idx_user_graph_severity severity TYPE set(16) GRANULARITY 1,
+    INDEX idx_user_graph_query_family query_family TYPE set(128) GRANULARITY 1,
+    INDEX idx_user_graph_route_corridor route_corridor TYPE set(128) GRANULARITY 1,
+    INDEX idx_user_graph_category_label category_label TYPE set(128) GRANULARITY 1,
+
+    INDEX idx_user_graph_root_profile_id root_profile_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_user_graph_graph_entry_id graph_entry_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_user_graph_seed_event_id seed_event_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_user_graph_seed_content_id seed_content_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_user_graph_seed_observation_id seed_observation_id TYPE bloom_filter(0.01) GRANULARITY 4,
+
+    INDEX idx_user_graph_primary_handle_norm primary_handle_norm TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_user_graph_primary_handle_skeleton primary_handle_skeleton TYPE bloom_filter(0.01) GRANULARITY 4,
+
+    INDEX idx_user_graph_normalized_text normalized_text TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(graph_date)
+ORDER BY (root_profile_id, graph_date)
+TTL graph_date + INTERVAL 730 DAY
+SETTINGS index_granularity = 8192;
+
+
+-- =====================================================================
+-- A2. 用户图谱人工研判当前状态表
+-- ---------------------------------------------------------------------
+-- 职责：
+--   1) 承接 graph / node / edge 级别的高频人工修正当前态
+--   2) 将高频变化字段从 hawkeye_ads_user_graph_latest 中拆出
+--   3) 作为前端 patch 写回的唯一热状态来源
+--
+-- object_id 稳定规则（必须严格遵守）：
+--   1) 严禁使用随机 UUID；否则图谱重刷后 patch 无法重放
+--   2) 必须使用“稳定业务键”生成 object_id，建议规范如下：
+--        graph                -> graph:{root_profile_id}
+--        profile node         -> profile:{profile_id}
+--        observable node      -> observable:{canonical_observable_id}
+--        content node         -> content:{content_id}
+--        event node           -> event:{event_id}
+--        source_registry node -> source_registry:{source_registry_id}
+--        edge                 -> edge:{stable_hash(src_object_id, dst_object_id, relation_type, evidence_key)}
+--   3) 若存在 graph_entry_id，可作为 graph 对象的稳定 object_id
+--
+-- 说明：
+--   1) 此表只保存“当前态 patch”，不保存原始事实
+--   2) 审计全轨迹可聚合写入 audit_logs_json
+-- =====================================================================
+CREATE TABLE hawkeye.hawkeye_dwd_user_graph_review_state
+(
+    -- -----------------------------------------------------------------
+    -- A. 主键与时间
+    -- -----------------------------------------------------------------
+    `root_profile_id` String COMMENT '所属根画像ID；回到 hawkeye_ads_user_graph_latest',
+    `object_type` LowCardinality(String) DEFAULT 'node' COMMENT '对象类型；graph/node/edge',
+    `object_id` String COMMENT '稳定对象ID；必须由稳定业务键生成，严禁随机 UUID',
+    `review_time` DateTime64(3) DEFAULT now64(3) COMMENT '本次人工研判时间；用于分区与 TTL',
+    `review_date` Date MATERIALIZED toDate(review_time) COMMENT '研判日期',
+    `update_time` DateTime64(3) DEFAULT now64(3) COMMENT '当前状态最近更新时间',
+
+    -- -----------------------------------------------------------------
+    -- B. 当前态字段（高频变化）
+    -- -----------------------------------------------------------------
+    `review_state` LowCardinality(String) DEFAULT 'unreviewed' COMMENT '当前研判状态；unreviewed/pending/accepted/rejected/modified/closed',
+    `patch_type` LowCardinality(String) DEFAULT 'manual_patch' COMMENT '补丁类型；manual_patch/alias_merge/evidence_accept/evidence_reject/tag_edit 等',
+    `graph_version` String DEFAULT '' COMMENT '对应图谱版本号；用于排障与重放',
+    `operator_id` String DEFAULT '' COMMENT '操作人ID',
+    `operator_name` String DEFAULT '' COMMENT '操作人显示名',
+    `operator_note` String CODEC(ZSTD(3)) DEFAULT '' COMMENT '人工备注',
+
+    -- -----------------------------------------------------------------
+    -- C. 业务补丁内容
+    -- -----------------------------------------------------------------
+    `patch_json` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '当前态补丁 JSON；例如 risk/status/tags/predicate/conf 变更',
+    `audit_logs_json` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '聚合审计日志 JSON；供页面查看 patch 历史',
+    `extra_json` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '少量扩展 JSON',
+
+    -- -----------------------------------------------------------------
+    -- D. 索引设计
+    -- -----------------------------------------------------------------
+    INDEX idx_user_graph_review_update_time update_time TYPE minmax GRANULARITY 1,
+    INDEX idx_user_graph_review_state review_state TYPE set(16) GRANULARITY 1,
+    INDEX idx_user_graph_patch_type patch_type TYPE set(32) GRANULARITY 1,
+    INDEX idx_user_graph_object_type object_type TYPE set(8) GRANULARITY 1,
+
+    INDEX idx_user_graph_review_root_profile_id root_profile_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_user_graph_review_object_id object_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_user_graph_review_operator_id operator_id TYPE bloom_filter(0.01) GRANULARITY 4
+)
+ENGINE = ReplacingMergeTree(update_time)
+PARTITION BY toYYYYMM(review_date)
+ORDER BY (root_profile_id, object_type, object_id)
+TTL review_date + INTERVAL 730 DAY
+SETTINGS index_granularity = 8192;
+
+
+
+-- =====================================================================
+-- B. identity_profile 落库层
+-- =====================================================================
+
+
+-- =====================================================================
+-- B1. 画像快照当前态表
+-- ---------------------------------------------------------------------
+-- 职责：
+--   1) 承接 serialize_profile_snapshot_row 的标准输出
+--   2) 作为画像真相快照层，供画像详情、候选召回、关系评分回放
+--   3) 不承载 user.html 整包 JSON
+--
+-- 说明：
+--   1) 本表是画像“当前态快照表”，不是历史快照归档表
+--   2) 若未来需要“某天某时版本”，建议另建 snapshot_history
+-- =====================================================================
+CREATE TABLE hawkeye.hawkeye_dwd_identity_profile_snapshot
+(
+    `profile_id` String COMMENT '画像ID；主键',
+    `profile_key` String DEFAULT '' COMMENT '画像稳定键；跨批次/跨任务稳定识别画像',
+    `primary_platform` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '主平台',
+    `primary_handle` String DEFAULT '' COMMENT '主账号',
+    `primary_handle_norm` String DEFAULT '' COMMENT '规范化主账号',
+    `primary_handle_skeleton` String DEFAULT '' COMMENT 'Handle 骨架值；用于候选预筛选',
+
+    `primary_threat_category` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '主威胁类别；画像算法主类别',
+    `primary_funnel_stage` LowCardinality(String) DEFAULT 'UNKNOWN' COMMENT '主漏斗阶段',
+
+    `platforms` Array(String) DEFAULT [] COMMENT '涉及平台集合',
+    `behavior_tags` Array(String) DEFAULT [] COMMENT '行为标签集合',
+    `route_corridors` Array(String) DEFAULT [] COMMENT '路线走廊集合',
+    `query_families` Array(String) DEFAULT [] COMMENT '查询家族集合',
+    `payment_methods` Array(String) DEFAULT [] COMMENT '支付方式集合',
+    `contact_methods` Array(String) DEFAULT [] COMMENT '联系方式集合',
+    `source_handles` Array(String) DEFAULT [] COMMENT '来源账号/别名集合',
+
+    `language_variants` Array(String) DEFAULT [] COMMENT '语言变体集合',
+    `visual_markers` Array(String) DEFAULT [] COMMENT '视觉标记集合',
+    `media_fingerprints` Array(String) DEFAULT [] COMMENT '媒体指纹集合',
+
+    `active_hours_utc` Array(UInt8) DEFAULT [] COMMENT '活跃小时（UTC 0-23）',
+    `timeline_days` Array(String) DEFAULT [] COMMENT '活跃日期集合（YYYY-MM-DD）',
+
+    `first_seen_at` DateTime64(3) DEFAULT toDateTime64('1970-01-01 00:00:00', 3) COMMENT '首次出现时间',
+    `last_seen_at` DateTime64(3) DEFAULT toDateTime64('1970-01-01 00:00:00', 3) COMMENT '最近一次出现时间',
+    `latest_observed_at` DateTime64(3) DEFAULT toDateTime64('1970-01-01 00:00:00', 3) COMMENT '最近一次观测时间',
+
+    `max_risk_score` Float32 DEFAULT 0 COMMENT '画像涉及内容/事件的最大风险分',
+    `report_count` UInt32 DEFAULT 0 COMMENT '关联报告/事件数量',
+    `suppressed_report_count` UInt32 DEFAULT 0 COMMENT '被抑制报告数',
+    `observable_count` UInt32 DEFAULT 0 COMMENT '画像 observable 数',
+
+    `snapshot_version` LowCardinality(String) DEFAULT 'v3' COMMENT '画像快照版本号',
+    `review_state` LowCardinality(String) DEFAULT 'unreviewed' COMMENT '画像当前人工研判状态',
+    `run_id` String DEFAULT '' COMMENT '算法任务 run_id',
+    `update_time` DateTime64(3) DEFAULT now64(3) COMMENT '最近更新时间',
+
+    INDEX idx_profile_snapshot_update_time update_time TYPE minmax GRANULARITY 1,
+    INDEX idx_profile_snapshot_latest_observed_at latest_observed_at TYPE minmax GRANULARITY 1,
+
+    INDEX idx_profile_snapshot_platform primary_platform TYPE set(64) GRANULARITY 1,
+    INDEX idx_profile_snapshot_threat primary_threat_category TYPE set(64) GRANULARITY 1,
+    INDEX idx_profile_snapshot_funnel primary_funnel_stage TYPE set(32) GRANULARITY 1,
+    INDEX idx_profile_snapshot_review_state review_state TYPE set(16) GRANULARITY 1,
+
+    INDEX idx_profile_snapshot_handle_norm primary_handle_norm TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_profile_snapshot_handle_skeleton primary_handle_skeleton TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_profile_snapshot_profile_key profile_key TYPE bloom_filter(0.01) GRANULARITY 4
+)
+ENGINE = ReplacingMergeTree(update_time)
+PARTITION BY toYYYYMM(update_time)
+ORDER BY (profile_id)
+TTL update_time + INTERVAL 730 DAY
+SETTINGS index_granularity = 8192;
+
+
+-- =====================================================================
+-- B2. 画像-可观测物明细表
+-- ---------------------------------------------------------------------
+-- 职责：
+--   1) 承接 serialize_profile_observable_rows 的标准输出
+--   2) 服务“给定 profile_id，加载该画像所有 observables”的路径
+--   3) 保持 profile_id 优先排序，保证画像详情加载效率
+--
+-- 统一命名策略：
+--   1) 保留 identity_profile 原始落库字段：
+--        subtype / normalized_value
+--   2) 同时提供 IOC 体系兼容别名：
+--        observable_subtype = subtype
+--        ioc_value_norm     = normalized_value
+--   3) 这样既不破坏算法落库契约，也方便与 IOC 表联查
+-- =====================================================================
+CREATE TABLE hawkeye.hawkeye_dwd_identity_profile_observable
+(
+    `profile_id` String COMMENT '画像ID；用于加载该画像的全部 observables',
+    `profile_key` String DEFAULT '' COMMENT '画像稳定键',
+
+    `observable_id` String DEFAULT '' COMMENT '原始 observable_id',
+    `canonical_observable_id` String COMMENT '规范化 observable_id；明细主键组成部分',
+
+    `category` LowCardinality(String) DEFAULT '' COMMENT '大类；如 account/contact/payment/device/network 等',
+    `subtype` LowCardinality(String) DEFAULT '' COMMENT 'identity_profile 原始字段：observable 小类',
+    `observable_subtype` LowCardinality(String) ALIAS subtype COMMENT 'IOC 体系兼容别名；等价于 subtype',
+
+    `canonical_type` LowCardinality(String) DEFAULT '' COMMENT '规范化类型；例如 wallet_address/domain/phone/telegram_handle',
+    `normalized_value` String DEFAULT '' COMMENT 'identity_profile 原始字段：规范化值',
+    `ioc_value_norm` String ALIAS normalized_value COMMENT 'IOC 体系兼容别名；等价于 normalized_value',
+    `canonical_value` String DEFAULT '' COMMENT '规范化标准值',
+    `display_value` String DEFAULT '' COMMENT '展示值；前端展示优先使用',
+
+    `score` Float32 DEFAULT 0 COMMENT '该画像使用该 observable 的强度分',
+    `reasons` Array(String) DEFAULT [] COMMENT '算法解释理由集合',
+    `seen_count` UInt32 DEFAULT 0 COMMENT '命中次数',
+    `profile_distinct_count` UInt32 DEFAULT 1 COMMENT '被多少画像共享；供 distinctiveness 折扣',
+    `raw_observable_ids` Array(String) DEFAULT [] COMMENT '原始 observable_id 集合',
+    `raw_subtypes` Array(String) DEFAULT [] COMMENT '原始 subtype 集合',
+
+    `first_seen_at` DateTime64(3) DEFAULT toDateTime64('1970-01-01 00:00:00', 3) COMMENT '首次出现时间',
+    `last_seen_at` DateTime64(3) DEFAULT toDateTime64('1970-01-01 00:00:00', 3) COMMENT '最近出现时间',
+
+    `snapshot_version` LowCardinality(String) DEFAULT 'v3' COMMENT '快照版本号',
+    `run_id` String DEFAULT '' COMMENT '算法任务 run_id',
+    `update_time` DateTime64(3) DEFAULT now64(3) COMMENT '最近更新时间',
+
+    INDEX idx_profile_observable_update_time update_time TYPE minmax GRANULARITY 1,
+    INDEX idx_profile_observable_profile_id profile_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_profile_observable_profile_key profile_key TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_profile_observable_canonical_id canonical_observable_id TYPE bloom_filter(0.01) GRANULARITY 4,
+
+    INDEX idx_profile_observable_subtype subtype TYPE set(256) GRANULARITY 1,
+    INDEX idx_profile_observable_canonical_type canonical_type TYPE set(256) GRANULARITY 1,
+    INDEX idx_profile_observable_value normalized_value TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_profile_observable_canonical_value canonical_value TYPE bloom_filter(0.01) GRANULARITY 4
+)
+ENGINE = ReplacingMergeTree(update_time)
+PARTITION BY toYYYYMM(update_time)
+ORDER BY (profile_id, canonical_observable_id)
+TTL update_time + INTERVAL 1095 DAY
+SETTINGS index_granularity = 8192;
+
+
+-- =====================================================================
+-- B3. observable -> profile 反向召回表
+-- ---------------------------------------------------------------------
+-- 职责：
+--   1) 专门服务“给定 observable，反查哪些 profile 使用过它”
+--   2) 主键直接对齐 IOC 查询习惯：
+--        (observable_subtype, ioc_value_norm)
+--   3) 作为候选预筛选 / 联动 IOC 页面 / 交叉画像检索的高效 lookup 表
+--
+-- 说明：
+--   1) 本表不是新的真相源，真相源仍然是 hawkeye_dwd_identity_profile_observable
+--   2) 本表可由 hawkeye_dwd_identity_profile_observable 全量或增量回刷
+--   3) 之所以不用直接改 profile_observable 的排序键，是为了不牺牲
+--      “按 profile_id 加载该画像明细”的主路径性能
+-- =====================================================================
+CREATE TABLE hawkeye.hawkeye_dwd_identity_observable_profile_lookup
+(
+    `observable_subtype` LowCardinality(String) COMMENT 'IOC 小类；主查询键第一部分',
+    `ioc_value_norm` String COMMENT '标准化 IOC 值；主查询键第二部分',
+
+    `canonical_observable_id` String COMMENT '规范化 observable_id',
+    `category` LowCardinality(String) DEFAULT '' COMMENT '大类',
+    `canonical_type` LowCardinality(String) DEFAULT '' COMMENT '规范化类型',
+    `canonical_value` String DEFAULT '' COMMENT '规范化标准值',
+    `display_value` String DEFAULT '' COMMENT '展示值',
+
+    `profile_id` String COMMENT '命中的画像ID',
+    `profile_key` String DEFAULT '' COMMENT '画像稳定键',
+
+    `score` Float32 DEFAULT 0 COMMENT '该画像使用该 observable 的强度分',
+    `profile_distinct_count` UInt32 DEFAULT 1 COMMENT '该 observable 被多少画像共享',
+    `first_seen_at` DateTime64(3) DEFAULT toDateTime64('1970-01-01 00:00:00', 3) COMMENT '该画像首次使用时间',
+    `last_seen_at` DateTime64(3) DEFAULT toDateTime64('1970-01-01 00:00:00', 3) COMMENT '该画像最近使用时间',
+
+    `snapshot_version` LowCardinality(String) DEFAULT 'v3' COMMENT '快照版本号',
+    `run_id` String DEFAULT '' COMMENT '算法任务 run_id',
+    `update_time` DateTime64(3) DEFAULT now64(3) COMMENT '最近更新时间',
+
+    -- 兼容 identity_profile 原始命名，方便双向复用 SQL
+    `subtype` LowCardinality(String) ALIAS observable_subtype COMMENT '兼容别名；等价于 observable_subtype',
+    `normalized_value` String ALIAS ioc_value_norm COMMENT '兼容别名；等价于 ioc_value_norm',
+
+    INDEX idx_observable_lookup_update_time update_time TYPE minmax GRANULARITY 1,
+    INDEX idx_observable_lookup_profile_id profile_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_observable_lookup_profile_key profile_key TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_observable_lookup_canonical_id canonical_observable_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_observable_lookup_canonical_type canonical_type TYPE set(256) GRANULARITY 1,
+    INDEX idx_observable_lookup_canonical_value canonical_value TYPE bloom_filter(0.01) GRANULARITY 4
+)
+ENGINE = ReplacingMergeTree(update_time)
+PARTITION BY toYYYYMM(update_time)
+ORDER BY (observable_subtype, ioc_value_norm, profile_id, canonical_observable_id)
+TTL update_time + INTERVAL 1095 DAY
+SETTINGS index_granularity = 8192;
+
+
+-- =====================================================================
+-- B4. 画像关系评分当前态表
+-- ---------------------------------------------------------------------
+-- 职责：
+--   1) 承接 serialize_relation_score_row 的标准输出
+--   2) 存储 profile-pair 的当前评分结果与解释信息
+--   3) 供人工审核、合并决策、图谱边渲染使用
+--
+-- 契约要求（必须遵守）：
+--   1) left_profile_id / right_profile_id 必须使用“稳定排序后”的左右值
+--      也就是与 identity_profile.py 中 sorted([left, right]) 一致
+--   2) pair_id 必须与 serialize_relation_score_row 生成的稳定 pair_id 一致
+--   3) 规范字段名统一为 hard_evidence
+--   4) 为兼容旧链路，保留 hard_evidence_json 作为 ALIAS
+-- =====================================================================
+CREATE TABLE hawkeye.hawkeye_dwd_identity_relation_score
+(
+    `pair_id` String COMMENT '稳定 pair_id；必须与 serialize_relation_score_row 输出一致',
+    `left_profile_id` String COMMENT '较小 profile_id；必须为稳定排序后的 left',
+    `right_profile_id` String COMMENT '较大 profile_id；必须为稳定排序后的 right',
+
+    `scorer_version` String DEFAULT '' COMMENT '打分器版本号',
+    `weights_version` String DEFAULT '' COMMENT '权重版本号',
+
+    `hard_score` Float32 DEFAULT 0 COMMENT '硬证据综合分',
+    `hard_evidence_count` UInt32 DEFAULT 0 COMMENT '硬证据条数',
+    `hard_evidence` String CODEC(ZSTD(5)) DEFAULT '' COMMENT '硬证据 JSON 数组；字段名与 serialize_relation_score_row 对齐',
+    `hard_evidence_json` String ALIAS hard_evidence COMMENT '兼容旧字段名；等价于 hard_evidence',
+
+    `context_similarity` Float32 DEFAULT 0 COMMENT '上下文相似度',
+    `context_multiplier` Float32 DEFAULT 1 COMMENT '上下文倍率',
+    `context_reasons` Array(String) DEFAULT [] COMMENT '上下文解释理由',
+
+    `temporal_similarity` Float32 DEFAULT 0 COMMENT '时间相似度',
+    `temporal_multiplier` Float32 DEFAULT 1 COMMENT '时间倍率',
+    `temporal_reasons` Array(String) DEFAULT [] COMMENT '时间解释理由',
+
+    `conflict_penalty` Float32 DEFAULT 0 COMMENT '冲突惩罚',
+    `conflict_reasons` Array(String) DEFAULT [] COMMENT '冲突解释理由',
+
+    `final_score` Float32 DEFAULT 0 COMMENT '最终关系分',
+    `relation_label` LowCardinality(String) DEFAULT 'not_related' COMMENT '关系标签；例如 self/duplicate/related/weak_related/not_related',
+
+    `shared_observable_ids` Array(String) DEFAULT [] COMMENT '共享的 canonical_observable_id 列表',
+    `shared_types` Array(String) DEFAULT [] COMMENT '共享的 canonical_type / category 列表',
+    `explainability_reasons` Array(String) DEFAULT [] COMMENT '最终可解释原因列表',
+
+    `review_state` LowCardinality(String) DEFAULT 'unreviewed' COMMENT '人工审核状态；补齐 serialize_relation_score_row 契约',
+    `merge_decision` LowCardinality(String) DEFAULT 'pending' COMMENT '合并决策；pending/merge/reject_merge/need_more_evidence 等',
+
+    `run_id` String DEFAULT '' COMMENT '算法任务 run_id',
+    `update_time` DateTime64(3) DEFAULT now64(3) COMMENT '最近更新时间',
+
+    INDEX idx_relation_score_update_time update_time TYPE minmax GRANULARITY 1,
+    INDEX idx_relation_score_pair_id pair_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_relation_score_left left_profile_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_relation_score_right right_profile_id TYPE bloom_filter(0.01) GRANULARITY 4,
+
+    INDEX idx_relation_score_final_score final_score TYPE minmax GRANULARITY 4,
+    INDEX idx_relation_score_relation_label relation_label TYPE set(16) GRANULARITY 1,
+    INDEX idx_relation_score_review_state review_state TYPE set(16) GRANULARITY 1,
+    INDEX idx_relation_score_merge_decision merge_decision TYPE set(16) GRANULARITY 1
+)
+ENGINE = ReplacingMergeTree(update_time)
+PARTITION BY toYYYYMM(update_time)
+ORDER BY (left_profile_id, right_profile_id)
+TTL update_time + INTERVAL 730 DAY
+SETTINGS index_granularity = 8192;
+
+
+-- =====================================================================
+-- 附：研发实现约定（务必同步到 ETL / API / 前端）
+-- ---------------------------------------------------------------------
+-- 1) Graph 服务层写入约定
+--    - hawkeye_ads_user_graph_latest 只写“一张图谱页当前态”
+--    - 若 root_profile_id 重刷，建议使用 delete + insert 或按分区幂等重刷
+--    - nodes_json / links_json 内部可携带丰富结构，但服务层显式列只保留高频字段
+--
+-- 2) Graph review patch 写入约定
+--    - graph/node/edge 的 object_id 必须稳定
+--    - patch_json 只保存“当前态差异”
+--    - audit_logs_json 可保存聚合后的审计历史
+--
+-- 3) profile_observable 与 observable_lookup 关系
+--    - hawkeye_dwd_identity_profile_observable      = 真相明细表
+--    - hawkeye_dwd_identity_observable_profile_lookup = 反向召回 lookup 表
+--    - lookup 表建议从明细表全量/增量构建，不应成为独立事实源
+--
+-- 4) relation_score 写入约定
+--    - left_profile_id / right_profile_id 必须先做稳定排序
+--    - pair_id 必须复用算法输出，不得自定义临时规则
+--    - hard_evidence 写 JSON 字符串；字段名不要再新造 hard_evidence_json
+--
+-- 5) 字段边界约定
+--    - threat_category = 标准威胁类别（与 ALERT / CONTENT 一致）
+--    - category_label  = UI/业务展示标签（可映射 threat_category，但不等价）
+--    - severity        = 标准风险等级（与 ALERT / CONTENT 一致）
+--    - level           = 仅兼容别名，不再作为新逻辑写入目标
+-- =====================================================================
